@@ -27,12 +27,18 @@ import {
   type ReactiveNode,
   assertProducerNode,
   producerRemoveLiveConsumerAtIndex,
+  producerUpdateValueVersion,
+  consumerBeforeComputation,
+  EFFECT_NODE,
+  EffectNode,
+  consumerAfterComputation,
+  consumerMarkClean,
 } from './graph.js';
 import {createSignal, signalGetFn, signalSetFn, type SignalNode} from './signal.js';
 
 const NODE: unique symbol = Symbol('node');
 
-let isState: (s: any) => boolean, isComputed: (s: any) => boolean, isWatcher: (s: any) => boolean;
+let isState: (s: any) => boolean, isComputed: (s: any) => boolean, isEffect: (s: any) => boolean;
 
 // eslint-disable-next-line @typescript-eslint/no-namespace
 export namespace Signal {
@@ -113,7 +119,7 @@ export namespace Signal {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   type AnySignal<T = any> = State<T> | Computed<T>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  type AnySink = Computed<any> | subtle.Watcher;
+  type AnySink = Computed<any> | subtle.Effect<any>;
 
   // eslint-disable-next-line @typescript-eslint/no-namespace
   export namespace subtle {
@@ -133,7 +139,7 @@ export namespace Signal {
     // Returns ordered list of all signals which this one referenced
     // during the last time it was evaluated
     export function introspectSources(sink: AnySink): AnySignal[] {
-      if (!isComputed(sink) && !isWatcher(sink)) {
+      if (!isComputed(sink) && !isEffect(sink)) {
         throw new TypeError('Called introspectSources without a Computed or Watcher argument');
       }
       return sink[NODE].producerNode?.map((n) => n.wrapper) ?? [];
@@ -161,7 +167,7 @@ export namespace Signal {
 
     // True iff introspectSources() is non-empty
     export function hasSources(signal: AnySink): boolean {
-      if (!isComputed(signal) && !isWatcher(signal)) {
+      if (!isComputed(signal) && !isEffect(signal)) {
         throw new TypeError('Called hasSources without a Computed or Watcher argument');
       }
       const producerNode = signal[NODE].producerNode;
@@ -169,98 +175,95 @@ export namespace Signal {
       return producerNode.length > 0;
     }
 
-    export class Watcher {
-      readonly [NODE]: ReactiveNode;
+    type HandleNotify<T> = (this: Effect<T>, allowFurtherNotifications: () => void) => void;
+
+    const defaultNotify: HandleNotify<any> = async function defaultNotify(
+      allowFurtherNotifications,
+    ) {
+      await Promise.resolve();
+      allowFurtherNotifications();
+      if (this.shouldExecute()) {
+        this.execute();
+      }
+    };
+
+    export class Effect<T> {
+      readonly [NODE]: EffectNode;
 
       #brand() {}
       static {
-        isWatcher = (w: any): w is Watcher => #brand in w;
+        isEffect = (w: any): w is Effect<any> => #brand in w;
       }
 
-      // When a (recursive) source of Watcher is written to, call this callback,
-      // if it hasn't already been called since the last `watch` call.
-      // No signals may be read or written during the notify.
-      constructor(notify: (this: Watcher) => void) {
-        let node = Object.create(REACTIVE_NODE);
+      constructor(execute: (this: Effect<T>) => T, notify: HandleNotify<T> = defaultNotify) {
+        let node = Object.create(EFFECT_NODE) as EffectNode;
         node.wrapper = this;
-        node.consumerMarkedDirty = notify;
-        node.consumerIsAlwaysLive = true;
+        node.consumerMarkedDirty = () => {
+          notify.call(this, () => {
+            node.dirty = false;
+          });
+        };
         node.consumerAllowSignalWrites = false;
         node.producerNode = [];
+        node.execute = execute;
         this[NODE] = node;
       }
 
-      #assertSignals(signals: AnySignal[]): void {
-        for (const signal of signals) {
-          if (!isComputed(signal) && !isState(signal)) {
-            throw new TypeError('Called watch/unwatch without a Computed or State argument');
-          }
-        }
-      }
-
-      // Add these signals to the Watcher's set, and set the watcher to run its
-      // notify callback next time any signal in the set (or one of its dependencies) changes.
-      // Can be called with no arguments just to reset the "notified" state, so that
-      // the notify callback will be invoked again.
-      watch(...signals: AnySignal[]): void {
-        if (!isWatcher(this)) {
-          throw new TypeError('Called unwatch without Watcher receiver');
-        }
-        this.#assertSignals(signals);
-
+      shouldExecute(): boolean {
         const node = this[NODE];
-        node.dirty = false; // Give the watcher a chance to trigger again
-        const prev = setActiveConsumer(node);
-        for (const signal of signals) {
-          producerAccessed(signal[NODE]);
-        }
-        setActiveConsumer(prev);
-      }
-
-      // Remove these signals from the watched set (e.g., for an effect which is disposed)
-      unwatch(...signals: AnySignal[]): void {
-        if (!isWatcher(this)) {
-          throw new TypeError('Called unwatch without Watcher receiver');
-        }
-        this.#assertSignals(signals);
-
-        const node = this[NODE];
-        assertConsumerNode(node);
-
-        let indicesToShift = [];
+        if (!node.producerNode) return true;
         for (let i = 0; i < node.producerNode.length; i++) {
-          if (signals.includes(node.producerNode[i].wrapper)) {
-            producerRemoveLiveConsumerAtIndex(node.producerNode[i], node.producerIndexOfThis[i]);
-            indicesToShift.push(i);
+          producerUpdateValueVersion(node.producerNode[i]);
+          if (node.producerLastReadVersion?.[i] !== node.producerNode[i].version) {
+            return true;
           }
         }
-        for (const idx of indicesToShift) {
-          // Logic copied from producerRemoveLiveConsumerAtIndex, but reversed
-          const lastIdx = node.producerNode!.length - 1;
-          node.producerNode![idx] = node.producerNode![lastIdx];
-          node.producerIndexOfThis[idx] = node.producerIndexOfThis[lastIdx];
+        return false;
+      }
 
-          node.producerNode.length--;
-          node.producerIndexOfThis.length--;
-          node.nextProducerIndex--;
-
-          if (idx < node.producerNode.length) {
-            const idxConsumer = node.producerIndexOfThis[idx];
-            const producer = node.producerNode[idx];
-            assertProducerNode(producer);
-            producer.liveConsumerIndexOfThis[idxConsumer] = idx;
+      execute(): T {
+        const node = this[NODE];
+        if (isInNotificationPhase()) {
+          throw new Error('Effects cannot be executed during the notification phase.');
+        }
+        const prevConsumer = consumerBeforeComputation(node);
+        try {
+          node.version++;
+          return node.execute();
+        } finally {
+          consumerAfterComputation(node, prevConsumer);
+          // Even if the effect throws, mark it as clean.
+          consumerMarkClean(node);
+          // todo: only check this if it didn't throw? Otherwise the underlying error will be swallowed?
+          if (!node?.producerNode?.length) {
+            throw new Error('Effects must consume at least one Signal.');
           }
         }
       }
 
-      // Returns the set of computeds in the Watcher's set which are still yet
-      // to be re-evaluated
-      getPending(): Computed<any>[] {
-        if (!isWatcher(this)) {
-          throw new TypeError('Called getPending without Watcher receiver');
-        }
+      attach(): void {
         const node = this[NODE];
-        return node.producerNode!.filter((n) => n.dirty).map((n) => n.wrapper);
+        node.dirty = false;
+        node.consumerIsLive = true;
+        if (!node.producerNode?.length) return;
+        const prev = setActiveConsumer(node);
+        try {
+          for (const sourceNode of node.producerNode) {
+            producerAccessed(sourceNode);
+          }
+        } finally {
+          setActiveConsumer(prev);
+        }
+      }
+
+      detach(): void {
+        const node = this[NODE];
+        node.consumerIsLive = false;
+        if (!node.producerNode?.length || !node.producerIndexOfThis?.length) return;
+
+        for (let i = 0; i < node.producerNode.length; i++) {
+          producerRemoveLiveConsumerAtIndex(node.producerNode[i], node.producerIndexOfThis[i]);
+        }
       }
     }
 

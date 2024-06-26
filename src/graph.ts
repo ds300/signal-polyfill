@@ -65,11 +65,20 @@ export const REACTIVE_NODE: ReactiveNode = {
   liveConsumerNode: undefined,
   liveConsumerIndexOfThis: undefined,
   consumerAllowSignalWrites: false,
-  consumerIsAlwaysLive: false,
+  consumerIsLive: false,
   producerMustRecompute: () => false,
   producerRecomputeValue: () => {},
   consumerMarkedDirty: () => {},
   consumerOnSignalRead: () => {},
+};
+
+export interface EffectNode extends ReactiveNode {
+  execute: () => any;
+}
+
+export const EFFECT_NODE: EffectNode = {
+  ...REACTIVE_NODE,
+  execute: () => {},
 };
 
 /**
@@ -165,7 +174,7 @@ export interface ReactiveNode {
    */
   consumerAllowSignalWrites: boolean;
 
-  readonly consumerIsAlwaysLive: boolean;
+  consumerIsLive: boolean;
 
   /**
    * Tracks whether producers need to recompute their value independently of the reactive graph (for
@@ -340,6 +349,14 @@ export function consumerMarkDirty(node: ReactiveNode): void {
 }
 
 /**
+ * Mark this consumer as clean.
+ */
+export function consumerMarkClean(node: ReactiveNode): void {
+  node.dirty = false;
+  node.lastCleanEpoch = epoch;
+}
+
+/**
  * Prepare this consumer to run a computation in its reactive context.
  *
  * Must be called by subclasses which represent reactive computations, before those computations
@@ -511,7 +528,7 @@ export function producerRemoveLiveConsumerAtIndex(node: ReactiveNode, idx: numbe
 }
 
 function consumerIsLive(node: ReactiveNode): boolean {
-  return node.consumerIsAlwaysLive || (node?.liveConsumerNode?.length ?? 0) > 0;
+  return node.consumerIsLive || (node?.liveConsumerNode?.length ?? 0) > 0;
 }
 
 export function assertConsumerNode(node: ReactiveNode): asserts node is ConsumerNode {
