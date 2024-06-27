@@ -195,7 +195,17 @@ export namespace Signal {
         isEffect = (w: any): w is Effect<any> => #brand in w;
       }
 
-      constructor(execute: (this: Effect<T>) => T, notify: HandleNotify<T> = defaultNotify) {
+      constructor(
+        // execute runs the effect, dereferencing any signals it depends on.
+        execute: (this: Effect<T>) => T,
+        // notify is called during the notification phase if any of the root signals
+        // in this effect's graph have changed. It should determine whether and how
+        // to call effect.execute() based on the current state of the effect.
+        // If it decides not to schedule the effect for execution, it should make sure to
+        // call allowFurtherNotifications() to ensure that the effect will be eligible for
+        // future notifications.
+        notify: HandleNotify<T> = defaultNotify,
+      ) {
         let node = Object.create(EFFECT_NODE) as EffectNode;
         node.wrapper = this;
         node.consumerMarkedDirty = () => {
@@ -209,6 +219,8 @@ export namespace Signal {
         this[NODE] = node;
       }
 
+      // Returns true if the effect has not executed before or if any of its sources have
+      // changed since the last time it executed.
       shouldExecute(): boolean {
         const node = this[NODE];
         if (!node.producerNode) return true;
@@ -221,6 +233,7 @@ export namespace Signal {
         return false;
       }
 
+      // Executes the effect synchronously.
       execute(): T {
         const node = this[NODE];
         if (isInNotificationPhase()) {
@@ -241,6 +254,9 @@ export namespace Signal {
         }
       }
 
+      // Attach the effect to the graph, making it live and eligible to receive notifications.
+      // Note that it will not receive notifications unless it has executed at least once before or after
+      // attach() is called.
       attach(): void {
         const node = this[NODE];
         node.dirty = false;
@@ -256,6 +272,7 @@ export namespace Signal {
         }
       }
 
+      // Detach the effect from the graph, making it dormant and no longer eligible to receive notifications.
       detach(): void {
         const node = this[NODE];
         node.consumerIsLive = false;
@@ -267,7 +284,7 @@ export namespace Signal {
       }
     }
 
-    export function currentComputed(): Computed<any> | undefined {
+    export function currentConsumer(): Computed<any> | Effect<any> | undefined {
       return getActiveConsumer()?.wrapper;
     }
 
