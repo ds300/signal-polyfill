@@ -38,7 +38,10 @@ import {createSignal, signalGetFn, signalSetFn, type SignalNode} from './signal.
 
 const NODE: unique symbol = Symbol('node');
 
-let isState: (s: any) => boolean, isComputed: (s: any) => boolean, isEffect: (s: any) => boolean;
+let isState: (s: any) => boolean;
+let isComputed: (s: any) => boolean;
+let isEffect: (s: any) => boolean;
+let isTrackingPool: (s: any) => boolean;
 
 // eslint-disable-next-line @typescript-eslint/no-namespace
 export namespace Signal {
@@ -186,6 +189,31 @@ export namespace Signal {
         this.execute();
       }
     };
+
+    export class TrackingPool {
+      readonly [NODE]: ComputedNode<number>;
+      #refCounts = new Map<AnySignal, number>();
+
+      #brand() {}
+      static {
+        isTrackingPool = (w: any): w is TrackingPool => #brand in w;
+      }
+
+      constructor() {
+        const ref = createComputed(() => this.#refCounts.size);
+        const node = ref[SIGNAL];
+        this[NODE] = node;
+        node.wrapper = this;
+      }
+
+      track(...signals: AnySignal[]): void {
+
+      }
+
+      untrack(...signalsOrTrackedFunctions: AnySignal[]): void {
+
+      }
+    }
 
     export class Effect<T> {
       readonly [NODE]: EffectNode;
